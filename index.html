@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <meta name="theme-color" content="#111827" />
+  <title>Person Counter Camera</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b1020;color:#fff;overflow:hidden}
+    .app{position:relative;width:100vw;height:100dvh;background:#000}
+    video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+    canvas{pointer-events:none}
+    .topbar{position:absolute;top:0;left:0;right:0;z-index:5;display:flex;gap:8px;align-items:center;padding:env(safe-area-inset-top) 12px 12px;background:linear-gradient(180deg,rgba(0,0,0,.7),rgba(0,0,0,0))}
+    .pill{backdrop-filter:blur(14px);background:rgba(17,24,39,.68);border:1px solid rgba(255,255,255,.14);border-radius:16px;padding:10px 12px;box-shadow:0 8px 30px rgba(0,0,0,.25)}
+    .metric{min-width:96px}
+    .metric .label{font-size:12px;color:#cbd5e1}
+    .metric .value{font-size:28px;font-weight:800;line-height:1}
+    .spacer{flex:1}
+    button,select{appearance:none;border:0;border-radius:12px;padding:10px 12px;font-weight:700;font-size:14px;background:#fff;color:#111827}
+    button.secondary{background:rgba(255,255,255,.13);color:#fff;border:1px solid rgba(255,255,255,.16)}
+    button.danger{background:#ef4444;color:#fff}
+    .controls{position:absolute;z-index:5;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .panel{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;padding:10px;border-radius:18px;background:rgba(17,24,39,.76);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.14)}
+    .panel label{display:flex;align-items:center;gap:8px;font-size:13px;color:#e5e7eb}
+    input[type="range"]{width:120px}
+    .status{position:absolute;z-index:6;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;border-radius:16px;background:rgba(0,0,0,.72);text-align:center;max-width:82vw}
+    .hidden{display:none}
+    .hint{font-size:12px;color:#cbd5e1;line-height:1.45}
+    .footer-note{font-size:11px;color:#94a3b8}
+    @media (max-width:520px){
+      .metric{min-width:82px}.metric .value{font-size:24px}
+      .topbar{padding-left:8px;padding-right:8px}.pill{padding:8px 10px}
+      button,select{font-size:13px;padding:10px}
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <video id="video" autoplay muted playsinline></video>
+  <canvas id="overlay"></canvas>
+
+  <div class="topbar">
+    <div class="pill metric"><div class="label">現在人数</div><div id="currentCount" class="value">0</div></div>
+    <div class="pill metric"><div class="label">累計カウント</div><div id="totalCount" class="value">0</div></div>
+    <div class="spacer"></div>
+    <button id="switchBtn" class="secondary">カメラ切替</button>
+  </div>
+
+  <div id="status" class="status">開始を押してください</div>
+
+  <div class="controls">
+    <button id="startBtn">▶ 開始</button>
+    <button id="resetBtn" class="danger">↺ 累計リセット</button>
+
+    <div class="panel">
+      <label>検出閾値
+        <input id="threshold" type="range" min="0.2" max="0.8" value="0.45" step="0.05">
+        <span id="thresholdValue">0.45</span>
+      </label>
+      <label>カウント方式
+        <select id="modeSelect">
+          <option value="new">新規出現</option>
+          <option value="line">ライン通過</option>
+        </select>
+      </label>
+      <div class="hint">緑の枠が人物検出です。ライン通過モードでは、画面中央の線を上→下に越えた人物を累計します。</div>
+      <div class="footer-note">※ 推定処理は端末上で実行。人物画像を保存・送信しません。</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const currentCountEl = document.getElementById('currentCount');
+const totalCountEl = document.getElementById('totalCount');
+const startBtn = document.getElementById('startBtn');
+const switchBtn = document.getElementById('switchBtn');
+const resetBtn = document.getElementById('resetBtn');
+const statusEl = document.getElementById('status');
+const thresholdEl = document.getElementById('threshold');
+const thresholdValueEl = document.getElementById('thresholdValue');
+const modeSelect = document.getElementById('modeSelect');
+
+let model = null;
+let stream = null;
+let running = false;
+let facingMode = 'environment';
+let totalCount = Number(localStorage.getItem('personCounterTotal') || 0);
+let tracks = new Map();
+let nextTrackId = 1;
+let lastLoop = 0;
+const DETECT_INTERVAL_MS = 180;
+const TRACK_TTL_MS = 1100;
+const MATCH_DIST = 120;
+
+totalCountEl.textContent = totalCount;
+
+thresholdEl.addEventListener('input', () => thresholdValueEl.textContent = thresholdEl.value);
+
+function setStatus(text, visible=true){statusEl.textContent=text;statusEl.classList.toggle('hidden', !visible)}
+
+async function ensureModel(){
+  if(model) return;
+  setStatus('AIモデル読込中…');
+  await tf.ready();
+  try { await tf.setBackend('webgl'); } catch(e) {}
+  model = await cocoSsd.load({base:'lite_mobilenet_v2'});
+}
+
+async function startCamera(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:{ideal:facingMode}, width:{ideal:1280}, height:{ideal:720}}, audio:false
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+function resizeCanvas(){
+  const rect = video.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(rect.width*dpr);
+  canvas.height = Math.round(rect.height*dpr);
+  canvas.style.width = rect.width+'px';
+  canvas.style.height = rect.height+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize', resizeCanvas);
+
+function projectBox(bbox){
+  const [x,y,w,h] = bbox;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const rw = video.clientWidth, rh = video.clientHeight;
+  const scale = Math.max(rw/vw, rh/vh);
+  const drawnW = vw*scale, drawnH = vh*scale;
+  const ox = (rw-drawnW)/2, oy = (rh-drawnH)/2;
+  return {x:x*scale+ox, y:y*scale+oy, w:w*scale, h:h*scale};
+}
+
+function matchTracks(detections, now){
+  const active = [...tracks.values()].filter(t=>now-t.lastSeen < TRACK_TTL_MS);
+  const used = new Set();
+
+  for(const d of detections){
+    const cx = d.x+d.w/2, cy = d.y+d.h/2;
+    let best=null, bestDist=Infinity;
+    for(const t of active){
+      if(used.has(t.id)) continue;
+      const dx=cx-t.cx, dy=cy-t.cy;
+      const dist=Math.hypot(dx,dy);
+      if(dist<bestDist && dist<MATCH_DIST){best=t;bestDist=dist}
+    }
+    if(best){
+      used.add(best.id);
+      best.prevCy=best.cy; best.cx=cx; best.cy=cy; best.box=d; best.lastSeen=now;
+      d.trackId=best.id;
+    } else {
+      const id=nextTrackId++;
+      tracks.set(id,{id,cx,cy,prevCy:cy,box:d,lastSeen:now,counted:false});
+      d.trackId=id;
+      if(modeSelect.value==='new') incrementTotal();
+    }
+  }
+  for(const [id,t] of tracks){if(now-t.lastSeen>3000) tracks.delete(id)}
+}
+
+function incrementTotal(){
+  totalCount++;
+  totalCountEl.textContent=totalCount;
+  localStorage.setItem('personCounterTotal', totalCount);
+}
+
+function applyLineCounting(){
+  const lineY = video.clientHeight*0.5;
+  for(const t of tracks.values()){
+    if(t.counted) continue;
+    if(t.prevCy < lineY && t.cy >= lineY){
+      t.counted=true;
+      incrementTotal();
+    }
+  }
+}
+
+function draw(detections){
+  const w=video.clientWidth,h=video.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  if(modeSelect.value==='line'){
+    const y=h*0.5;
+    ctx.save();
+    ctx.setLineDash([14,10]);
+    ctx.lineWidth=4;
+    ctx.strokeStyle='rgba(250,204,21,.95)';
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(250,204,21,.95)';
+    ctx.font='bold 14px system-ui';ctx.fillText('COUNT LINE ↓',12,y-10);
+    ctx.restore();
+  }
+  for(const d of detections){
+    ctx.lineWidth=4;ctx.strokeStyle='#22c55e';ctx.strokeRect(d.x,d.y,d.w,d.h);
+    ctx.fillStyle='#22c55e';
+    ctx.fillRect(d.x,Math.max(0,d.y-26),132,26);
+    ctx.fillStyle='#06120a';ctx.font='bold 14px system-ui';
+    ctx.fillText(`PERSON ${Math.round(d.score*100)}%`, d.x+6, Math.max(18,d.y-8));
+  }
+}
+
+async function detectLoop(ts){
+  if(!running) return;
+  requestAnimationFrame(detectLoop);
+  if(ts-lastLoop<DETECT_INTERVAL_MS || video.readyState<2 || !model) return;
+  lastLoop=ts;
+  try{
+    const preds = await model.detect(video, 20, Number(thresholdEl.value));
+    const persons = preds.filter(p=>p.class==='person').map(p=>({...projectBox(p.bbox),score:p.score}));
+    currentCountEl.textContent=persons.length;
+    matchTracks(persons, performance.now());
+    if(modeSelect.value==='line') applyLineCounting();
+    draw(persons);
+  }catch(e){console.error(e)}
+}
+
+startBtn.addEventListener('click', async()=>{
+  try{
+    if(!navigator.mediaDevices?.getUserMedia) throw new Error('このブラウザはカメラAPIに対応していません');
+    startBtn.disabled=true;
+    await ensureModel();
+    setStatus('カメラ起動中…');
+    await startCamera();
+    resizeCanvas();
+    tracks.clear();
+    running=true;
+    setStatus('',false);
+    requestAnimationFrame(detectLoop);
+    startBtn.textContent='● 稼働中';
+  }catch(e){
+    console.error(e);
+    setStatus('起動できませんでした。HTTPSで開き、カメラ許可をONにしてください。');
+    startBtn.disabled=false;
+  }
+});
+
+switchBtn.addEventListener('click', async()=>{
+  if(!stream) return;
+  facingMode = facingMode==='environment'?'user':'environment';
+  try{setStatus('カメラ切替中…');await startCamera();resizeCanvas();tracks.clear();setStatus('',false)}catch(e){setStatus('カメラ切替に失敗しました')}
+});
+
+resetBtn.addEventListener('click',()=>{
+  totalCount=0;totalCountEl.textContent='0';localStorage.setItem('personCounterTotal','0');tracks.clear();
+});
+
+modeSelect.addEventListener('change',()=>tracks.clear());
+</script>
+</body>
+</html>
